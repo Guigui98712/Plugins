@@ -12,6 +12,9 @@ view = doc.ActiveView
 STYLE_NAME = "SL_PRETO_1,5"
 OFFSET_MM = 100.0
 TOLERANCE = 1e-6
+DOOR_AVOID_BAND_MM = 350.0
+MIN_INNER_OFFSET_MM = 80.0
+SMALL_ROOM_THRESHOLD_MM = 2200.0
 
 
 class RoomCandidate(object):
@@ -198,6 +201,133 @@ def make_point_from_local(origin, axis_u, axis_v, pu, pv, z_value):
     x = origin.X + axis_u.X * pu + axis_v.X * pv
     y = origin.Y + axis_u.Y * pu + axis_v.Y * pv
     return DB.XYZ(x, y, z_value)
+
+
+def to_internal_mm(mm_value):
+    return DB.UnitUtils.ConvertToInternalUnits(mm_value, DB.UnitTypeId.Millimeters)
+
+
+def clamp_inner_offset(span_length, desired_offset):
+    min_offset = to_internal_mm(MIN_INNER_OFFSET_MM)
+    max_offset = span_length * 0.35
+    if max_offset <= min_offset:
+        return max(min_offset * 0.5, span_length * 0.2)
+    return min(desired_offset, max_offset)
+
+
+def get_element_center_point(element, active_view):
+    location = getattr(element, "Location", None)
+    if isinstance(location, DB.LocationPoint):
+        return location.Point
+
+    bbox = element.get_BoundingBox(active_view)
+    if bbox is None:
+        bbox = element.get_BoundingBox(None)
+    if bbox is None:
+        return None
+
+    return DB.XYZ(
+        (bbox.Min.X + bbox.Max.X) * 0.5,
+        (bbox.Min.Y + bbox.Max.Y) * 0.5,
+        (bbox.Min.Z + bbox.Max.Z) * 0.5,
+    )
+
+
+def get_door_points_local(candidate, room_point, active_view):
+    points = []
+    wall_ids = set([seg[2].Id.IntegerValue for seg in candidate.loop_segments])
+    if not wall_ids:
+        return points
+
+    doors = DB.FilteredElementCollector(doc, active_view.Id)
+    doors = doors.OfCategory(DB.BuiltInCategory.OST_Doors).WhereElementIsNotElementType()
+
+    for door in doors:
+        host = getattr(door, "Host", None)
+        if host is None:
+            continue
+        if host.Id.IntegerValue not in wall_ids:
+            continue
+
+        center = get_element_center_point(door, active_view)
+        if center is None:
+            continue
+
+        pu = project_point_to_axis(center, room_point, candidate.axis_u)
+        pv = project_point_to_axis(center, room_point, candidate.axis_v)
+        points.append((pu, pv))
+
+    return points
+
+
+def side_score_by_doors(door_points_local, coord_value, is_horizontal):
+    if not door_points_local:
+        return 1e9
+
+    band = to_internal_mm(DOOR_AVOID_BAND_MM)
+    collisions = 0
+    min_dist = None
+
+    for pu, pv in door_points_local:
+        distance = abs((pv if is_horizontal else pu) - coord_value)
+        if distance < band:
+            collisions += 1
+        if min_dist is None or distance < min_dist:
+            min_dist = distance
+
+    if min_dist is None:
+        min_dist = 0.0
+
+    return (min_dist * 10.0) - (collisions * 1000.0)
+
+
+def pick_horizontal_side(min_v, max_v, inset_v, door_points_local):
+    top_v = max_v - inset_v
+    bottom_v = min_v + inset_v
+
+    top_score = side_score_by_doors(door_points_local, top_v, True)
+    bottom_score = side_score_by_doors(door_points_local, bottom_v, True)
+
+    if bottom_score > top_score:
+        return "bottom", bottom_v
+    return "top", top_v
+
+
+def pick_vertical_side(min_u, max_u, inset_u, door_points_local):
+    right_u = max_u - inset_u
+    left_u = min_u + inset_u
+
+    right_score = side_score_by_doors(door_points_local, right_u, False)
+    left_score = side_score_by_doors(door_points_local, left_u, False)
+
+    if left_score > right_score:
+        return "left", left_u
+    return "right", right_u
+
+
+def opposite_horizontal(side_name):
+    return "bottom" if side_name == "top" else "top"
+
+
+def opposite_vertical(side_name):
+    return "left" if side_name == "right" else "right"
+
+
+def get_horizontal_coord(side_name, min_v, max_v, inset_v):
+    return (max_v - inset_v) if side_name == "top" else (min_v + inset_v)
+
+
+def get_vertical_coord(side_name, min_u, max_u, inset_u):
+    return (max_u - inset_u) if side_name == "right" else (min_u + inset_u)
+
+
+def set_dimension_text_center(dimension, line_start, line_end):
+    try:
+        midpoint = (line_start + line_end) * 0.5
+        if hasattr(dimension, "TextPosition"):
+            dimension.TextPosition = midpoint
+    except Exception:
+        pass
 
 
 def get_face_midpoint(face):
@@ -611,6 +741,22 @@ def main():
                 continue
 
             min_u, max_u, min_v, max_v = extents
+            width = max_u - min_u
+            height = max_v - min_v
+
+            inset_u = clamp_inner_offset(width, offset)
+            inset_v = clamp_inner_offset(height, offset)
+
+            door_points_local = get_door_points_local(candidate, room_point, view)
+
+            horizontal_side, horizontal_pv = pick_horizontal_side(min_v, max_v, inset_v, door_points_local)
+            vertical_side, vertical_pu = pick_vertical_side(min_u, max_u, inset_u, door_points_local)
+
+            small_room_threshold = to_internal_mm(SMALL_ROOM_THRESHOLD_MM)
+            if min(width, height) < small_room_threshold:
+                # In small rooms, try opposite side for vertical dim to reduce corner crowding.
+                vertical_side = opposite_vertical(vertical_side)
+                vertical_pu = get_vertical_coord(vertical_side, min_u, max_u, inset_u)
 
             left_ref, right_ref, _ = get_wall_reference_pair(
                 walls["left"], walls["right"], candidate.axis_u, room_point
@@ -624,24 +770,55 @@ def main():
                 room_transaction.RollBack()
                 continue
 
-            horizontal_pv = max_v + offset
-            horizontal_line = DB.Line.CreateBound(
-                make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, min_u - offset, horizontal_pv, center_z),
-                make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, max_u + offset, horizontal_pv, center_z),
+            horizontal_start = make_point_from_local(
+                room_point, candidate.axis_u, candidate.axis_v, min_u + inset_u, horizontal_pv, center_z
             )
+            horizontal_end = make_point_from_local(
+                room_point, candidate.axis_u, candidate.axis_v, max_u - inset_u, horizontal_pv, center_z
+            )
+            horizontal_line = DB.Line.CreateBound(horizontal_start, horizontal_end)
             horizontal_dimension = create_dimension(doc, view, dim_type, horizontal_line, [left_ref, right_ref])
 
-            vertical_pu = max_u + offset
-            vertical_line = DB.Line.CreateBound(
-                make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, vertical_pu, min_v - offset, center_z),
-                make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, vertical_pu, max_v + offset, center_z),
+            if horizontal_dimension is None:
+                horizontal_side = opposite_horizontal(horizontal_side)
+                horizontal_pv = get_horizontal_coord(horizontal_side, min_v, max_v, inset_v)
+                horizontal_start = make_point_from_local(
+                    room_point, candidate.axis_u, candidate.axis_v, min_u + inset_u, horizontal_pv, center_z
+                )
+                horizontal_end = make_point_from_local(
+                    room_point, candidate.axis_u, candidate.axis_v, max_u - inset_u, horizontal_pv, center_z
+                )
+                horizontal_line = DB.Line.CreateBound(horizontal_start, horizontal_end)
+                horizontal_dimension = create_dimension(doc, view, dim_type, horizontal_line, [left_ref, right_ref])
+
+            vertical_start = make_point_from_local(
+                room_point, candidate.axis_u, candidate.axis_v, vertical_pu, min_v + inset_v, center_z
             )
+            vertical_end = make_point_from_local(
+                room_point, candidate.axis_u, candidate.axis_v, vertical_pu, max_v - inset_v, center_z
+            )
+            vertical_line = DB.Line.CreateBound(vertical_start, vertical_end)
             vertical_dimension = create_dimension(doc, view, dim_type, vertical_line, [bottom_ref, top_ref])
+
+            if vertical_dimension is None:
+                vertical_side = opposite_vertical(vertical_side)
+                vertical_pu = get_vertical_coord(vertical_side, min_u, max_u, inset_u)
+                vertical_start = make_point_from_local(
+                    room_point, candidate.axis_u, candidate.axis_v, vertical_pu, min_v + inset_v, center_z
+                )
+                vertical_end = make_point_from_local(
+                    room_point, candidate.axis_u, candidate.axis_v, vertical_pu, max_v - inset_v, center_z
+                )
+                vertical_line = DB.Line.CreateBound(vertical_start, vertical_end)
+                vertical_dimension = create_dimension(doc, view, dim_type, vertical_line, [bottom_ref, top_ref])
 
             if horizontal_dimension is None or vertical_dimension is None:
                 append_skip(skipped_rooms, room, "falha ao criar uma ou mais cotas")
                 room_transaction.RollBack()
                 continue
+
+            set_dimension_text_center(horizontal_dimension, horizontal_start, horizontal_end)
+            set_dimension_text_center(vertical_dimension, vertical_start, vertical_end)
 
             status = room_transaction.Commit()
             if status == DB.TransactionStatus.Committed:
