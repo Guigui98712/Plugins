@@ -30,13 +30,31 @@ def count_ifc_storeys(ifc_text):
 
 def read_text_file(file_path):
     """Lê arquivo com múltiplas tentativas de encoding."""
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+    import sys
+    
+    # Tentar vários encodings
+    encodings_to_try = [
+        "utf-8-sig", 
+        "utf-8", 
+        "latin-1",
+        "cp1252",
+        sys.getdefaultencoding()
+    ]
+    
+    errors_list = []
+    
+    for encoding in encodings_to_try:
         try:
-            with open(file_path, "r", encoding=encoding) as handle:
-                return handle.read()
-        except Exception:
-            pass
-    raise IOError("Nao foi possivel ler o arquivo IFC.")
+            with open(file_path, "r", encoding=encoding, errors="ignore") as handle:
+                content = handle.read()
+                if content and len(content) > 10:  # Validar que leu algo
+                    return content
+        except Exception as e:
+            errors_list.append("{}: {}".format(encoding, str(e)))
+    
+    # Se chegou aqui, não conseguiu ler
+    error_details = "\n".join(errors_list)
+    raise IOError("Nao foi possivel ler o arquivo IFC com nenhum encoding.\nTentativas:\n{}".format(error_details))
 
 
 def extract_ifc_entities(ifc_text):
@@ -68,17 +86,42 @@ def get_revit_levels():
 def main():
     """Função principal."""
     try:
-        # Selecionar arquivo IFC
-        ifc_path = forms.pick_file(file_ext="ifc")
-        if not ifc_path:
+        # Verificar se há arquivo carregado
+        if not doc:
+            forms.alert("Nenhum documento Revit aberto.", title="Erro")
             return
         
-        if not os.path.exists(ifc_path):
-            forms.alert("Arquivo IFC nao encontrado.", title="Erro")
+        # Obter caminho do arquivo IFC carregado
+        doc_path = doc.PathName
+        if not doc_path:
+            forms.alert(
+                "O documento nao foi salvo ou nao é um arquivo IFC.\n\n"
+                "Abra um arquivo .ifc no Revit primeiro.",
+                title="Erro",
+                warn_icon=True
+            )
+            return
+        
+        if not doc_path.lower().endswith('.ifc'):
+            forms.alert(
+                "Este plugin funciona apenas com arquivos .ifc\n\n"
+                "Arquivo atual: {}\n\n"
+                "Abra um arquivo .ifc no Revit.".format(doc_path),
+                title="Aviso",
+                warn_icon=True
+            )
+            return
+        
+        if not os.path.exists(doc_path):
+            forms.alert(
+                "Arquivo nao encontrado: {}".format(doc_path),
+                title="Erro",
+                warn_icon=True
+            )
             return
         
         # Ler arquivo
-        ifc_text = read_text_file(ifc_path)
+        ifc_text = read_text_file(doc_path)
         
         # Contar pavimentos
         ifc_storeys = count_ifc_storeys(ifc_text)
@@ -107,11 +150,12 @@ def main():
             return
         
         # Resumo
-        summary = "Analise do arquivo IFC:\n"
+        summary = "Analise do arquivo IFC:\n\n"
+        summary += "Arquivo: {}\n\n".format(os.path.basename(doc_path))
         summary += "- Colunas encontradas: {}\n".format(len(columns))
         summary += "- Vigas encontradas: {}\n".format(len(beams))
         summary += "- Pavimentos no IFC: {}\n".format(ifc_storeys)
-        summary += "- Pavimentos no Revit: {}\n".format(len(revit_levels))
+        summary += "- Pavimentos no Revit: {}".format(len(revit_levels))
         
         forms.alert(summary, title="Resultado da Analise")
         
