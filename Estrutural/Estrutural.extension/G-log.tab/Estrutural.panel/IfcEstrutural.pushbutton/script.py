@@ -1,53 +1,29 @@
 # -*- coding: utf-8 -*-
-"""IFC Estrutural - Detecta links IFC no Revit"""
+"""IFC Estrutural - Trabalha com importação (CAD/IFC importado)"""
 
-import os
 from pyrevit import DB, forms, revit
 
 doc = revit.doc
 
-# Encontrar arquivos IFC vinculados
-ifc_links = []
+# Buscar todos os ImportInstance (geometria importada)
+collector = DB.FilteredElementCollector(doc).OfClass(DB.ImportInstance)
+imports = list(collector)
 
-try:
-    collector = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance)
+if not imports:
+    forms.alert("Nenhuma geometria importada encontrada.", title="Aviso")
+else:
+    msg = "GEOMETRIA IMPORTADA ENCONTRADA:\n\n"
+    msg += "Total: {} elementos\n\n".format(len(imports))
+    msg += "Primeiros elementos:\n"
     
-    for link in collector:
+    for i, imp in enumerate(imports[:5]):
         try:
-            link_doc = link.GetLinkDocument()
-            if link_doc:
-                path = link_doc.PathName
-                if path and path.lower().endswith('.ifc'):
-                    ifc_links.append({
-                        'name': os.path.basename(path),
-                        'path': path,
-                        'link': link
-                    })
+            name = imp.Name
+            elem_id = imp.Id.IntegerValue
+            msg += "- {} (ID: {})\n".format(name, elem_id)
         except:
             pass
-except:
-    pass
-
-# Resultado
-if not ifc_links:
-    forms.alert(
-        "Nenhum arquivo IFC vinculado encontrado no modelo.\n\n"
-        "Você precisa vincular um arquivo .ifc no Revit.",
-        title="Sem links IFC"
-    )
-else:
-    if len(ifc_links) == 1:
-        ifc = ifc_links[0]
-        msg = "IFC encontrado:\n\n{}".format(ifc['name'])
-    else:
-        # Múltiplos IFC - deixar escolher
-        names = [ifc['name'] for ifc in ifc_links]
-        idx = forms.SelectFromList.show(names, title="Selecione o IFC")
-        
-        if idx is None or idx < 0:
-            forms.alert("Cancelado.", title="Info")
-        else:
-            ifc = ifc_links[idx]
-            msg = "IFC selecionado:\n\n{}".format(ifc['name'])
     
-    forms.alert(msg, title="OK - Pronto para processar")
+    msg += "\n--- PRONTO PARA PROCESSAR ---"
+    
+    forms.alert(msg, title="OK - Estrutura Detectada")
