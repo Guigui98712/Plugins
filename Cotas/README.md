@@ -9,7 +9,7 @@ Criar cotas para comodos fechados e esquadrejados na vista ativa, usando o estil
 ## Estrutura
 
 - `Cotas.extension`
-- `Cotas.tab`
+- `G-log.tab`
 - `Comodos.panel`
 - `CotarComodos.pushbutton`
 - `script.py`

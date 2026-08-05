@@ -11,10 +11,15 @@ view = doc.ActiveView
 
 STYLE_NAME = "SL_PRETO_1,5"
 OFFSET_MM = 100.0
+OUTSIDE_MARGIN_MM = 80.0
+INSIDE_MARGIN_MM = 40.0
 TOLERANCE = 1e-6
 DOOR_AVOID_BAND_MM = 350.0
 MIN_INNER_OFFSET_MM = 80.0
 SMALL_ROOM_THRESHOLD_MM = 2200.0
+CORNER_CLEARANCE_MM = 260.0
+DIMENSION_SEPARATION_MM = 180.0
+ADDITIONAL_OFFSET_STEP_MM = 140.0
 
 
 class RoomCandidate(object):
@@ -207,12 +212,86 @@ def to_internal_mm(mm_value):
     return DB.UnitUtils.ConvertToInternalUnits(mm_value, DB.UnitTypeId.Millimeters)
 
 
+def to_mm(internal_value):
+    return DB.UnitUtils.ConvertFromInternalUnits(internal_value, DB.UnitTypeId.Millimeters)
+
+
 def clamp_inner_offset(span_length, desired_offset):
     min_offset = to_internal_mm(MIN_INNER_OFFSET_MM)
     max_offset = span_length * 0.35
     if max_offset <= min_offset:
         return max(min_offset * 0.5, span_length * 0.2)
     return min(desired_offset, max_offset)
+
+
+def get_wall_thickness_mm(wall):
+    thickness = None
+
+    try:
+        thickness = getattr(wall, "Width", None)
+    except Exception:
+        thickness = None
+
+    if thickness is None:
+        try:
+            wall_type = wall.WallType
+            thickness = getattr(wall_type, "Width", None)
+        except Exception:
+            thickness = None
+
+    if thickness is None:
+        return 0.0
+
+    try:
+        thickness_value = float(thickness)
+    except Exception:
+        return 0.0
+
+    if thickness_value <= 0.0:
+        return 0.0
+
+    try:
+        return to_mm(thickness_value)
+    except Exception:
+        return 0.0
+
+
+def get_outer_line_offset_mm(wall):
+    wall_thickness_mm = get_wall_thickness_mm(wall)
+    if wall_thickness_mm <= 0.0:
+        return OFFSET_MM
+    return max(OFFSET_MM, wall_thickness_mm + OUTSIDE_MARGIN_MM)
+
+
+def get_inner_line_offset_mm(wall):
+    wall_thickness_mm = get_wall_thickness_mm(wall)
+    if wall_thickness_mm <= 0.0:
+        return max(OFFSET_MM * 0.5, INSIDE_MARGIN_MM)
+    return max(max(OFFSET_MM * 0.5, INSIDE_MARGIN_MM), wall_thickness_mm * 0.35)
+
+
+def get_wall_centerline_coord(wall, axis, room_point):
+    try:
+        location = wall.Location
+        location_curve = getattr(location, "Curve", None)
+        if not isinstance(location_curve, DB.Line):
+            return None
+        midpoint = (location_curve.GetEndPoint(0) + location_curve.GetEndPoint(1)) * 0.5
+        return project_point_to_axis(midpoint, room_point, axis)
+    except Exception:
+        return None
+
+
+def is_boundary_face_interior(boundary_coord, centerline_coord):
+    if centerline_coord is None:
+        return True
+    return abs(boundary_coord) <= abs(centerline_coord)
+
+
+def get_side_line_coord(wall, axis, room_point, boundary_coord):
+    offset_mm = get_outer_line_offset_mm(wall)
+    direction = -1.0 if boundary_coord >= 0.0 else 1.0
+    return boundary_coord + (direction * to_internal_mm(offset_mm))
 
 
 def get_element_center_point(element, active_view):
@@ -281,6 +360,179 @@ def side_score_by_doors(door_points_local, coord_value, is_horizontal):
     return (min_dist * 10.0) - (collisions * 1000.0)
 
 
+def intervals_overlap(start_a, end_a, start_b, end_b):
+    return min(end_a, end_b) - max(start_a, start_b) > TOLERANCE
+
+
+def build_inset_candidates(span_length, base_inset):
+    if span_length <= TOLERANCE:
+        return []
+
+    max_inset = span_length * 0.45
+    candidate_values = [
+        base_inset,
+        base_inset + to_internal_mm(ADDITIONAL_OFFSET_STEP_MM),
+        base_inset + to_internal_mm(ADDITIONAL_OFFSET_STEP_MM * 2.0),
+        span_length * 0.25,
+        span_length * 0.33,
+    ]
+
+    candidates = []
+    for value in candidate_values:
+        inset = min(value, max_inset)
+        if inset <= TOLERANCE:
+            continue
+        duplicate = False
+        for existing in candidates:
+            if abs(existing - inset) <= TOLERANCE:
+                duplicate = True
+                break
+        if not duplicate:
+            candidates.append(inset)
+
+    if not candidates:
+        candidates.append(min(base_inset, max_inset))
+
+    return candidates
+
+
+def build_dimension_candidate(candidate, orientation, side_name, line_coord, inset, min_u, max_u, min_v, max_v, room_point, center_z):
+    if orientation == "horizontal":
+        span_min = min_u + inset
+        span_max = max_u - inset
+        if span_max - span_min <= TOLERANCE:
+            return None
+
+        coord = line_coord
+        start = make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, span_min, coord, center_z)
+        end = make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, span_max, coord, center_z)
+    else:
+        span_min = min_v + inset
+        span_max = max_v - inset
+        if span_max - span_min <= TOLERANCE:
+            return None
+
+        coord = line_coord
+        start = make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, coord, span_min, center_z)
+        end = make_point_from_local(room_point, candidate.axis_u, candidate.axis_v, coord, span_max, center_z)
+
+    line = DB.Line.CreateBound(start, end)
+    return {
+        "orientation": orientation,
+        "side": side_name,
+        "inset": inset,
+        "coord": coord,
+        "span_min": span_min,
+        "span_max": span_max,
+        "start": start,
+        "end": end,
+        "line": line,
+    }
+
+
+def door_collision_penalty(candidate, door_points_local):
+    if not door_points_local:
+        return 0.0
+
+    band = to_internal_mm(DOOR_AVOID_BAND_MM)
+    penalty = 0.0
+
+    for pu, pv in door_points_local:
+        along = pu if candidate["orientation"] == "horizontal" else pv
+        perp = pv if candidate["orientation"] == "horizontal" else pu
+
+        if along < candidate["span_min"] - band or along > candidate["span_max"] + band:
+            continue
+
+        distance = abs(perp - candidate["coord"])
+        if distance < band:
+            penalty += (band - distance) * 20000.0 + 50000.0
+
+    return penalty
+
+
+def occupied_dimension_penalty(candidate, placed_dimensions):
+    if not placed_dimensions:
+        return 0.0
+
+    separation = to_internal_mm(DIMENSION_SEPARATION_MM)
+    penalty = 0.0
+
+    for placed in placed_dimensions:
+        if placed["orientation"] != candidate["orientation"]:
+            continue
+
+        coord_gap = abs(candidate["coord"] - placed["coord"])
+        if coord_gap >= separation:
+            continue
+
+        if not intervals_overlap(candidate["span_min"], candidate["span_max"], placed["span_min"], placed["span_max"]):
+            continue
+
+        overlap = min(candidate["span_max"], placed["span_max"]) - max(candidate["span_min"], placed["span_min"])
+        penalty += (separation - coord_gap) * 15000.0 + overlap * 5000.0
+
+    return penalty
+
+
+def corner_crowding_penalty(horizontal_candidate, vertical_candidate):
+    clearance = to_internal_mm(CORNER_CLEARANCE_MM)
+    min_inset = min(horizontal_candidate["inset"], vertical_candidate["inset"])
+    if min_inset >= clearance:
+        return 0.0
+    return (clearance - min_inset) * 25000.0
+
+
+def score_dimension_candidate(candidate, door_points_local, placed_dimensions):
+    penalty = door_collision_penalty(candidate, door_points_local)
+    penalty += occupied_dimension_penalty(candidate, placed_dimensions)
+    return -penalty
+
+
+def build_dimension_pair_candidates(candidate, walls, min_u, max_u, min_v, max_v, room_point, center_z, door_points_local, placed_dimensions):
+    horizontal_candidates = []
+    vertical_candidates = []
+
+    for side_name in ["top", "bottom"]:
+        base_inset = clamp_inner_offset(max_v - min_v, to_internal_mm(MIN_INNER_OFFSET_MM))
+        wall = walls[side_name]
+        boundary_coord = max_v if side_name == "top" else min_v
+        line_coord = get_side_line_coord(wall, candidate.axis_v, room_point, boundary_coord)
+        for inset in build_inset_candidates(max_v - min_v, base_inset):
+            dim_candidate = build_dimension_candidate(
+                candidate, "horizontal", side_name, line_coord, inset, min_u, max_u, min_v, max_v, room_point, center_z
+            )
+            if dim_candidate is None:
+                continue
+            dim_candidate["score"] = score_dimension_candidate(dim_candidate, door_points_local, placed_dimensions)
+            horizontal_candidates.append(dim_candidate)
+
+    for side_name in ["left", "right"]:
+        base_inset = clamp_inner_offset(max_u - min_u, to_internal_mm(MIN_INNER_OFFSET_MM))
+        wall = walls[side_name]
+        boundary_coord = min_u if side_name == "left" else max_u
+        line_coord = get_side_line_coord(wall, candidate.axis_u, room_point, boundary_coord)
+        for inset in build_inset_candidates(max_u - min_u, base_inset):
+            dim_candidate = build_dimension_candidate(
+                candidate, "vertical", side_name, line_coord, inset, min_u, max_u, min_v, max_v, room_point, center_z
+            )
+            if dim_candidate is None:
+                continue
+            dim_candidate["score"] = score_dimension_candidate(dim_candidate, door_points_local, placed_dimensions)
+            vertical_candidates.append(dim_candidate)
+
+    pair_candidates = []
+    for horizontal_candidate in horizontal_candidates:
+        for vertical_candidate in vertical_candidates:
+            pair_score = horizontal_candidate["score"] + vertical_candidate["score"]
+            pair_score -= corner_crowding_penalty(horizontal_candidate, vertical_candidate)
+            total_inset = horizontal_candidate["inset"] + vertical_candidate["inset"]
+            pair_candidates.append((pair_score, total_inset, horizontal_candidate, vertical_candidate))
+
+    pair_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return pair_candidates
+
+
 def pick_horizontal_side(min_v, max_v, inset_v, door_points_local):
     top_v = max_v - inset_v
     bottom_v = min_v + inset_v
@@ -314,7 +566,7 @@ def opposite_vertical(side_name):
 
 
 def get_horizontal_coord(side_name, min_v, max_v, inset_v):
-    return (max_v - inset_v) if side_name == "top" else (min_v + inset_v)
+    return (max_v + inset_v) if side_name == "top" else (min_v - inset_v)
 
 
 def get_vertical_coord(side_name, min_u, max_u, inset_u):
@@ -689,148 +941,139 @@ def main():
         )
         return
 
-    offset = DB.UnitUtils.ConvertToInternalUnits(OFFSET_MM, DB.UnitTypeId.Millimeters)
     created_count = 0
     processed_count = 0
+    placed_dimensions = []
 
     for candidate in eligible_rooms:
         processed_count += 1
         room = candidate.room
+        bbox = get_room_bbox(room, view)
+        if bbox is None:
+            append_skip(skipped_rooms, room, "sem bounding box na vista")
+            continue
 
-        room_transaction = Transaction(doc, "Cotar comodo {}".format(room_label(room)))
-        failure_options = room_transaction.GetFailureHandlingOptions()
-        failure_options.SetFailuresPreprocessor(RoomDimensionFailurePreprocessor())
-        failure_options.SetClearAfterRollback(True)
-        room_transaction.SetFailureHandlingOptions(failure_options)
+        center_z = get_room_z(room, view)
+        if center_z is None:
+            append_skip(skipped_rooms, room, "nao foi possivel determinar o nivel da vista")
+            continue
 
-        room_transaction.Start()
-        try:
-            bbox = get_room_bbox(room, view)
-            if bbox is None:
-                append_skip(skipped_rooms, room, "sem bounding box na vista")
-                room_transaction.RollBack()
-                continue
+        room_point = get_room_point(room, bbox)
+        if room_point is None:
+            append_skip(skipped_rooms, room, "nao foi possivel determinar o centro do comodo")
+            continue
 
-            center_z = get_room_z(room, view)
-            if center_z is None:
-                append_skip(skipped_rooms, room, "nao foi possivel determinar o nivel da vista")
-                room_transaction.RollBack()
-                continue
+        walls = choose_walls(candidate)
+        if walls is None:
+            append_skip(skipped_rooms, room, "nao foi possivel identificar as paredes principais")
+            continue
 
-            room_point = get_room_point(room, bbox)
-            if room_point is None:
-                append_skip(skipped_rooms, room, "nao foi possivel determinar o centro do comodo")
-                room_transaction.RollBack()
-                continue
+        if walls["left"].Id == walls["right"].Id or walls["bottom"].Id == walls["top"].Id:
+            append_skip(skipped_rooms, room, "lados opostos apontaram para a mesma parede")
+            continue
 
-            walls = choose_walls(candidate)
-            if walls is None:
-                append_skip(skipped_rooms, room, "nao foi possivel identificar as paredes principais")
-                room_transaction.RollBack()
-                continue
+        extents = get_candidate_extents(candidate, room_point)
+        if extents is None:
+            append_skip(skipped_rooms, room, "nao foi possivel calcular os limites do comodo")
+            continue
 
-            if walls["left"].Id == walls["right"].Id or walls["bottom"].Id == walls["top"].Id:
-                append_skip(skipped_rooms, room, "lados opostos apontaram para a mesma parede")
-                room_transaction.RollBack()
-                continue
+        min_u, max_u, min_v, max_v = extents
+        width = max_u - min_u
+        height = max_v - min_v
 
-            extents = get_candidate_extents(candidate, room_point)
-            if extents is None:
-                append_skip(skipped_rooms, room, "nao foi possivel calcular os limites do comodo")
-                room_transaction.RollBack()
-                continue
+        door_points_local = get_door_points_local(candidate, room_point, view)
+        pair_candidates = build_dimension_pair_candidates(
+            candidate,
+            walls,
+            min_u,
+            max_u,
+            min_v,
+            max_v,
+            room_point,
+            center_z,
+            door_points_local,
+            placed_dimensions,
+        )
 
-            min_u, max_u, min_v, max_v = extents
-            width = max_u - min_u
-            height = max_v - min_v
+        if not pair_candidates:
+            append_skip(skipped_rooms, room, "nao foi possivel gerar posicoes seguras para as cotas")
+            continue
 
-            inset_u = clamp_inner_offset(width, offset)
-            inset_v = clamp_inner_offset(height, offset)
+        room_created = False
+        last_reason = "falha ao criar uma ou mais cotas"
 
-            door_points_local = get_door_points_local(candidate, room_point, view)
+        for _, _, horizontal_candidate, vertical_candidate in pair_candidates:
+            room_transaction = Transaction(doc, "Cotar comodo {}".format(room_label(room)))
+            failure_options = room_transaction.GetFailureHandlingOptions()
+            failure_options.SetFailuresPreprocessor(RoomDimensionFailurePreprocessor())
+            failure_options.SetClearAfterRollback(True)
+            room_transaction.SetFailureHandlingOptions(failure_options)
 
-            horizontal_side, horizontal_pv = pick_horizontal_side(min_v, max_v, inset_v, door_points_local)
-            vertical_side, vertical_pu = pick_vertical_side(min_u, max_u, inset_u, door_points_local)
-
-            small_room_threshold = to_internal_mm(SMALL_ROOM_THRESHOLD_MM)
-            if min(width, height) < small_room_threshold:
-                # In small rooms, try opposite side for vertical dim to reduce corner crowding.
-                vertical_side = opposite_vertical(vertical_side)
-                vertical_pu = get_vertical_coord(vertical_side, min_u, max_u, inset_u)
-
-            left_ref, right_ref, _ = get_wall_reference_pair(
-                walls["left"], walls["right"], candidate.axis_u, room_point
-            )
-            bottom_ref, top_ref, _ = get_wall_reference_pair(
-                walls["bottom"], walls["top"], candidate.axis_v, room_point
-            )
-
-            if None in (left_ref, right_ref, bottom_ref, top_ref):
-                append_skip(skipped_rooms, room, "nao foi possivel obter pares de referencias paralelas")
-                room_transaction.RollBack()
-                continue
-
-            horizontal_start = make_point_from_local(
-                room_point, candidate.axis_u, candidate.axis_v, min_u + inset_u, horizontal_pv, center_z
-            )
-            horizontal_end = make_point_from_local(
-                room_point, candidate.axis_u, candidate.axis_v, max_u - inset_u, horizontal_pv, center_z
-            )
-            horizontal_line = DB.Line.CreateBound(horizontal_start, horizontal_end)
-            horizontal_dimension = create_dimension(doc, view, dim_type, horizontal_line, [left_ref, right_ref])
-
-            if horizontal_dimension is None:
-                horizontal_side = opposite_horizontal(horizontal_side)
-                horizontal_pv = get_horizontal_coord(horizontal_side, min_v, max_v, inset_v)
-                horizontal_start = make_point_from_local(
-                    room_point, candidate.axis_u, candidate.axis_v, min_u + inset_u, horizontal_pv, center_z
-                )
-                horizontal_end = make_point_from_local(
-                    room_point, candidate.axis_u, candidate.axis_v, max_u - inset_u, horizontal_pv, center_z
-                )
-                horizontal_line = DB.Line.CreateBound(horizontal_start, horizontal_end)
-                horizontal_dimension = create_dimension(doc, view, dim_type, horizontal_line, [left_ref, right_ref])
-
-            vertical_start = make_point_from_local(
-                room_point, candidate.axis_u, candidate.axis_v, vertical_pu, min_v + inset_v, center_z
-            )
-            vertical_end = make_point_from_local(
-                room_point, candidate.axis_u, candidate.axis_v, vertical_pu, max_v - inset_v, center_z
-            )
-            vertical_line = DB.Line.CreateBound(vertical_start, vertical_end)
-            vertical_dimension = create_dimension(doc, view, dim_type, vertical_line, [bottom_ref, top_ref])
-
-            if vertical_dimension is None:
-                vertical_side = opposite_vertical(vertical_side)
-                vertical_pu = get_vertical_coord(vertical_side, min_u, max_u, inset_u)
-                vertical_start = make_point_from_local(
-                    room_point, candidate.axis_u, candidate.axis_v, vertical_pu, min_v + inset_v, center_z
-                )
-                vertical_end = make_point_from_local(
-                    room_point, candidate.axis_u, candidate.axis_v, vertical_pu, max_v - inset_v, center_z
-                )
-                vertical_line = DB.Line.CreateBound(vertical_start, vertical_end)
-                vertical_dimension = create_dimension(doc, view, dim_type, vertical_line, [bottom_ref, top_ref])
-
-            if horizontal_dimension is None or vertical_dimension is None:
-                append_skip(skipped_rooms, room, "falha ao criar uma ou mais cotas")
-                room_transaction.RollBack()
-                continue
-
-            set_dimension_text_center(horizontal_dimension, horizontal_start, horizontal_end)
-            set_dimension_text_center(vertical_dimension, vertical_start, vertical_end)
-
-            status = room_transaction.Commit()
-            if status == DB.TransactionStatus.Committed:
-                created_count += 2
-            else:
-                append_skip(skipped_rooms, room, "cotas revertidas por falha de geometria")
-        except Exception as room_exc:
+            room_transaction.Start()
             try:
-                room_transaction.RollBack()
-            except Exception:
-                pass
-            append_skip(skipped_rooms, room, "erro: {}".format(str(room_exc)))
+                left_ref, right_ref, _ = get_wall_reference_pair(
+                    walls["left"], walls["right"], candidate.axis_u, room_point
+                )
+                bottom_ref, top_ref, _ = get_wall_reference_pair(
+                    walls["bottom"], walls["top"], candidate.axis_v, room_point
+                )
+
+                if None in (left_ref, right_ref, bottom_ref, top_ref):
+                    last_reason = "nao foi possivel obter pares de referencias paralelas"
+                    room_transaction.RollBack()
+                    continue
+
+                horizontal_dimension = create_dimension(
+                    doc, view, dim_type, horizontal_candidate["line"], [left_ref, right_ref]
+                )
+                vertical_dimension = create_dimension(
+                    doc, view, dim_type, vertical_candidate["line"], [bottom_ref, top_ref]
+                )
+
+                if horizontal_dimension is None or vertical_dimension is None:
+                    last_reason = "falha ao criar uma ou mais cotas"
+                    room_transaction.RollBack()
+                    continue
+
+                set_dimension_text_center(horizontal_dimension, horizontal_candidate["start"], horizontal_candidate["end"])
+                set_dimension_text_center(vertical_dimension, vertical_candidate["start"], vertical_candidate["end"])
+
+                status = room_transaction.Commit()
+                if status == DB.TransactionStatus.Committed:
+                    created_count += 2
+                    placed_dimensions.append(
+                        {
+                            "orientation": horizontal_candidate["orientation"],
+                            "coord": horizontal_candidate["coord"],
+                            "span_min": horizontal_candidate["span_min"],
+                            "span_max": horizontal_candidate["span_max"],
+                        }
+                    )
+                    placed_dimensions.append(
+                        {
+                            "orientation": vertical_candidate["orientation"],
+                            "coord": vertical_candidate["coord"],
+                            "span_min": vertical_candidate["span_min"],
+                            "span_max": vertical_candidate["span_max"],
+                        }
+                    )
+                    room_created = True
+                    break
+
+                try:
+                    room_transaction.RollBack()
+                except Exception:
+                    pass
+                last_reason = "cotas revertidas por falha de geometria"
+            except Exception as room_exc:
+                try:
+                    room_transaction.RollBack()
+                except Exception:
+                    pass
+                last_reason = "erro: {}".format(str(room_exc))
+
+        if not room_created:
+            append_skip(skipped_rooms, room, last_reason)
 
     summary_lines = [
         "Processados: {}".format(processed_count),
