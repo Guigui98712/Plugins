@@ -324,5 +324,11 @@ def main():
         )
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as fatal_exc:
+    show_error(
+        "Erro inesperado na execucao",
+        str(fatal_exc),
+        traceback.format_exc()
+    )
