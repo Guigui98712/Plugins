@@ -14,13 +14,12 @@ doc = revit.doc
 
 
 def get_linked_ifc_files():
-    """Detecta arquivos IFC vinculados no modelo Revit."""
+    """Detecta arquivos IFC vinculados - múltiplas estratégias."""
     ifc_files = []
     
+    # Estratégia 1: RevitLinkInstance
     try:
-        # Obter todos os elementos vinculados
         collector = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance)
-        
         for link_instance in collector:
             try:
                 link_doc = link_instance.GetLinkDocument()
@@ -31,101 +30,131 @@ def get_linked_ifc_files():
                         ifc_files.append({
                             'path': doc_path,
                             'name': file_name,
-                            'instance': link_instance
+                            'source': 'RevitLinkInstance'
                         })
             except Exception:
                 pass
-    except Exception as e:
+    except Exception:
+        pass
+    
+    # Estratégia 2: ExternalFileReference (mais robusto)
+    try:
+        external_files = doc.ExternalFileReferences
+        for ext_file in external_files:
+            try:
+                file_path = DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(ext_file.GetPath())
+                if file_path and file_path.lower().endswith('.ifc'):
+                    file_name = os.path.basename(file_path)
+                    # Evitar duplicatas
+                    if not any(f['path'] == file_path for f in ifc_files):
+                        ifc_files.append({
+                            'path': file_path,
+                            'name': file_name,
+                            'source': 'ExternalFileReference'
+                        })
+            except Exception:
+                pass
+    except Exception:
         pass
     
     return ifc_files
 
 
-def select_ifc_from_list(ifc_files):
-    """Permite selecionar arquivo IFC da lista de links."""
+def select_ifc_file(ifc_files):
+    """Permite selecionar arquivo IFC."""
     if len(ifc_files) == 1:
         return ifc_files[0]
     
     if len(ifc_files) > 1:
-        # Mostrar diálogo para escolher qual IFC usar
-        file_names = [f['name'] for f in ifc_files]
+        file_names = ["{} ({})".format(f['name'], f['source']) for f in ifc_files]
         selected_index = forms.SelectFromList.show(
             file_names,
-            title="Selecionar arquivo IFC",
-            button_name="Usar"
+            title="Selecionar arquivo IFC"
         )
         
-        if selected_index is None or selected_index < 0:
-            return None
-        
-        return ifc_files[selected_index]
+        if selected_index is not None and selected_index >= 0:
+            return ifc_files[selected_index]
+    
+    # Se não encontrou automaticamente, permitir seleção manual
+    result = forms.ask_for_one_option(
+        ["Selecionar arquivo .ifc manualmente"],
+        title="Nenhum IFC detectado"
+    )
+    
+    if result:
+        ifc_path = forms.pick_file(file_ext="ifc")
+        if ifc_path and os.path.exists(ifc_path):
+            return {
+                'path': ifc_path,
+                'name': os.path.basename(ifc_path),
+                'source': 'Manual'
+            }
     
     return None
-
-
-def normalize_text(value):
-    """Remove acentos e caracteres especiais."""
-    if value is None:
-        return ""
-    text = str(value).strip()
-    text = unicodedata.normalize("NFKD", text)
-    text = text.encode("ascii", "ignore").decode("utf-8")
-    return re.sub(r"[^a-z0-9\s/x\-]", "", text.lower())
-
-
-def count_ifc_storeys(ifc_text):
-    """Conta níveis/pavimentos no arquivo IFC."""
-    return len(re.findall(r"\bIFCBUILDINGSTOREY\s*\(", ifc_text, flags=re.IGNORECASE))
 
 
 def read_text_file(file_path):
     """Lê arquivo com múltiplas tentativas de encoding."""
     import sys
     
-    # Tentar vários encodings
-    encodings_to_try = [
-        "utf-8-sig", 
-        "utf-8", 
-        "latin-1",
-        "cp1252",
-        sys.getdefaultencoding()
-    ]
+    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252", sys.getdefaultencoding()]
     
-    errors_list = []
-    
-    for encoding in encodings_to_try:
+    for encoding in encodings:
         try:
-            with open(file_path, "r", encoding=encoding, errors="ignore") as handle:
-                content = handle.read()
-                if content and len(content) > 10:  # Validar que leu algo
+            with open(file_path, "r", encoding=encoding, errors="ignore") as f:
+                content = f.read()
+                if content and len(content) > 100:
                     return content
-        except Exception as e:
-            errors_list.append("{}: {}".format(encoding, str(e)))
+        except Exception:
+            pass
     
-    # Se chegou aqui, não conseguiu ler
-    error_details = "\n".join(errors_list)
-    raise IOError("Nao foi possivel ler o arquivo IFC com nenhum encoding.\nTentativas:\n{}".format(error_details))
+    raise IOError("Falha ao ler arquivo: {}".format(file_path))
 
 
-def extract_ifc_entities(ifc_text):
-    """Extrai entidades (Column, Beam) do texto IFC."""
-    column_pattern = r"#\d+\s*=\s*IFCCOLUMN\s*\((.*?)\)\s*;"
-    beam_pattern = r"#\d+\s*=\s*IFCBEAM\s*\((.*?)\)\s*;"
+def count_ifc_storeys(ifc_text):
+    """Conta pavimentos no IFC."""
+    return len(re.findall(r"\bIFCBUILDINGSTOREY\s*\(", ifc_text, re.IGNORECASE))
+
+
+def extract_ifc_elements(ifc_text):
+    """Extrai elementos estruturais do IFC com dados completos."""
+    elements = {
+        'columns': [],
+        'beams': [],
+        'slabs': []
+    }
     
-    columns = []
-    beams = []
+    # Padrões melhorados para capturar mais dados
+    column_pattern = r"#(\d+)\s*=\s*IFCCOLUMN\s*\(([^)]+)\)"
+    beam_pattern = r"#(\d+)\s*=\s*IFCBEAM\s*\(([^)]+)\)"
+    slab_pattern = r"#(\d+)\s*=\s*IFCSLAB\s*\(([^)]+)\)"
     
     for match in re.finditer(column_pattern, ifc_text, re.IGNORECASE | re.DOTALL):
-        columns.append(("COLUMN", match.group(1)))
+        elements['columns'].append({
+            'id': match.group(1),
+            'data': match.group(2),
+            'type': 'COLUMN'
+        })
     
     for match in re.finditer(beam_pattern, ifc_text, re.IGNORECASE | re.DOTALL):
-        beams.append(("BEAM", match.group(1)))
+        elements['beams'].append({
+            'id': match.group(1),
+            'data': match.group(2),
+            'type': 'BEAM'
+        })
     
-    return columns, beams
+    for match in re.finditer(slab_pattern, ifc_text, re.IGNORECASE | re.DOTALL):
+        elements['slabs'].append({
+            'id': match.group(1),
+            'data': match.group(2),
+            'type': 'SLAB'
+        })
+    
+    return elements
 
 
 def get_revit_levels():
-    """Retorna dicionário de níveis do Revit."""
+    """Retorna níveis do Revit."""
     levels = {}
     collector = DB.FilteredElementCollector(doc).OfClass(DB.Level)
     for level in collector:
@@ -134,78 +163,66 @@ def get_revit_levels():
 
 
 def main():
-    """Função principal."""
+    """Função principal - análise inicial e validação."""
     try:
-        # Validar se tem modelo Revit aberto
         if not doc:
             forms.alert("Nenhum documento Revit aberto.", title="Erro")
             return
         
-        # Detectar arquivos IFC vinculados
+        # Detectar ou selecionar arquivo IFC
         ifc_files = get_linked_ifc_files()
+        selected_ifc = select_ifc_file(ifc_files)
         
-        if not ifc_files:
-            forms.alert(
-                "Nenhum arquivo IFC vinculado encontrado no modelo.\n\n"
-                "Vincule um arquivo .ifc antes de usar este plugin.",
-                title="Aviso",
-                warn_icon=True
-            )
-            return
-        
-        # Selecionar qual IFC usar (se houver mais de um)
-        selected_ifc = select_ifc_from_list(ifc_files)
         if not selected_ifc:
             return
         
         ifc_path = selected_ifc['path']
         ifc_name = selected_ifc['name']
         
-        # Ler arquivo IFC
-        ifc_text = read_text_file(ifc_path)
+        if not os.path.exists(ifc_path):
+            forms.alert("Arquivo não encontrado: {}".format(ifc_path), title="Erro")
+            return
         
-        # Contar pavimentos
+        # Ler e analisar
+        ifc_text = read_text_file(ifc_path)
         ifc_storeys = count_ifc_storeys(ifc_text)
         revit_levels = get_revit_levels()
+        elements = extract_ifc_elements(ifc_text)
         
+        # Validações
         if ifc_storeys > len(revit_levels):
-            msg = (
-                "O arquivo IFC tem {} pavimentos, "
-                "mas o modelo Revit tem apenas {}.\n\n"
-                "Crie os pavimentos necessarios antes de continuar.".format(
-                    ifc_storeys, len(revit_levels)
-                )
-            )
-            forms.alert(msg, title="Aviso de Pavimentos", warn_icon=True)
-            return
-        
-        # Extrair entidades
-        columns, beams = extract_ifc_entities(ifc_text)
-        
-        if not columns and not beams:
             forms.alert(
-                "Nenhuma coluna ou viga encontrada no arquivo IFC.",
-                title="Aviso",
-                warn_icon=True
+                "IFC tem {} pavimentos, Revit tem {}.\n\n"
+                "Crie os pavimentos necessários.".format(ifc_storeys, len(revit_levels)),
+                title="Aviso"
             )
             return
         
-        # Resumo
-        summary = "Analise do arquivo IFC vinculado:\n\n"
-        summary += "Arquivo: {}\n\n".format(ifc_name)
-        summary += "- Colunas encontradas: {}\n".format(len(columns))
-        summary += "- Vigas encontradas: {}\n".format(len(beams))
-        summary += "- Pavimentos no IFC: {}\n".format(ifc_storeys)
-        summary += "- Pavimentos no Revit: {}".format(len(revit_levels))
+        if not (elements['columns'] or elements['beams'] or elements['slabs']):
+            forms.alert(
+                "Nenhum elemento estrutural encontrado no IFC.",
+                title="Aviso"
+            )
+            return
         
-        forms.alert(summary, title="Resultado da Analise")
+        # Mostrar resultado
+        summary = "ANÁLISE DO ARQUIVO IFC\n\n"
+        summary += "Arquivo: {}\n".format(ifc_name)
+        summary += "Fonte: {}\n\n".format(selected_ifc['source'])
+        summary += "ELEMENTOS ENCONTRADOS:\n"
+        summary += "- Colunas: {}\n".format(len(elements['columns']))
+        summary += "- Vigas: {}\n".format(len(elements['beams']))
+        summary += "- Lajes: {}\n\n".format(len(elements['slabs']))
+        summary += "MODELO REVIT:\n"
+        summary += "- Pavimentos IFC: {}\n".format(ifc_storeys)
+        summary += "- Pavimentos Revit: {}".format(len(revit_levels))
+        
+        forms.alert(summary, title="Análise - OK")
         
     except Exception as e:
-        error_msg = traceback.format_exc()
         forms.alert(
-            "Erro ao processar IFC:\n{}\n\nDetalhe:\n{}".format(str(e), error_msg),
-            title="Erro",
-            warn_icon=True
+            "Erro:\n{}\n\n{}".format(str(e), traceback.format_exc()),
+            title="Erro"
         )
 
 
@@ -213,7 +230,6 @@ try:
     main()
 except Exception as fatal_exc:
     forms.alert(
-        "Erro inesperado:\n{}".format(traceback.format_exc()),
-        title="Erro Fatal",
-        warn_icon=True
+        "Erro fatal:\n{}".format(traceback.format_exc()),
+        title="Erro Fatal"
     )
