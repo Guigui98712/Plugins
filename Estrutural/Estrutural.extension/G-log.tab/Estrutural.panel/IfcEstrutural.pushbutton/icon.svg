@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <!-- Fundo -->
+  <rect width="32" height="32" fill="white" stroke="none"/>
+  
+  <!-- Base estrutural (pilares) -->
+  <!-- Pilar esquerdo -->
+  <rect x="4" y="8" width="3" height="18" fill="#2E75B6" stroke="#1F4E78" stroke-width="0.5"/>
+  
+  <!-- Pilar direito -->
+  <rect x="25" y="8" width="3" height="18" fill="#2E75B6" stroke="#1F4E78" stroke-width="0.5"/>
+  
+  <!-- Viga horizontal superior -->
+  <rect x="4" y="10" width="24" height="2" fill="#E74C3C" stroke="#C0392B" stroke-width="0.5"/>
+  
+  <!-- Viga horizontal inferior -->
+  <rect x="4" y="20" width="24" height="2" fill="#E74C3C" stroke="#C0392B" stroke-width="0.5"/>
+  
+  <!-- Elemento estrutural central (IFC) -->
+  <g transform="translate(16, 16)">
+    <!-- Dimensões de coluna -->
+    <rect x="-5" y="-5" width="10" height="10" fill="none" stroke="#27AE60" stroke-width="1"/>
+    
+    <!-- Marcas de dimensão -->
+    <line x1="-7" y1="-5" x2="-7" y2="5" stroke="#27AE60" stroke-width="0.5"/>
+    <line x1="-8" y1="-5" x2="-6" y2="-5" stroke="#27AE60" stroke-width="0.5"/>
+    <line x1="-8" y1="5" x2="-6" y2="5" stroke="#27AE60" stroke-width="0.5"/>
+  </g>
+  
+  <!-- Indicador "IFC" -->
+  <text x="16" y="28" font-size="8" font-weight="bold" text-anchor="middle" fill="#2E75B6" font-family="Arial">IFC</text>
+</svg>
