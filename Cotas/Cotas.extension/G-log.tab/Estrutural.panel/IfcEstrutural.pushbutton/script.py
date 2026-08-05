@@ -13,6 +13,56 @@ from Autodesk.Revit.DB.Structure import StructuralType
 doc = revit.doc
 
 
+def get_linked_ifc_files():
+    """Detecta arquivos IFC vinculados no modelo Revit."""
+    ifc_files = []
+    
+    try:
+        # Obter todos os elementos vinculados
+        collector = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance)
+        
+        for link_instance in collector:
+            try:
+                link_doc = link_instance.GetLinkDocument()
+                if link_doc:
+                    doc_path = link_doc.PathName
+                    if doc_path and doc_path.lower().endswith('.ifc'):
+                        file_name = os.path.basename(doc_path)
+                        ifc_files.append({
+                            'path': doc_path,
+                            'name': file_name,
+                            'instance': link_instance
+                        })
+            except Exception:
+                pass
+    except Exception as e:
+        pass
+    
+    return ifc_files
+
+
+def select_ifc_from_list(ifc_files):
+    """Permite selecionar arquivo IFC da lista de links."""
+    if len(ifc_files) == 1:
+        return ifc_files[0]
+    
+    if len(ifc_files) > 1:
+        # Mostrar diálogo para escolher qual IFC usar
+        file_names = [f['name'] for f in ifc_files]
+        selected_index = forms.SelectFromList.show(
+            file_names,
+            title="Selecionar arquivo IFC",
+            button_name="Usar"
+        )
+        
+        if selected_index is None or selected_index < 0:
+            return None
+        
+        return ifc_files[selected_index]
+    
+    return None
+
+
 def normalize_text(value):
     """Remove acentos e caracteres especiais."""
     if value is None:
@@ -86,42 +136,33 @@ def get_revit_levels():
 def main():
     """Função principal."""
     try:
-        # Verificar se há arquivo carregado
+        # Validar se tem modelo Revit aberto
         if not doc:
             forms.alert("Nenhum documento Revit aberto.", title="Erro")
             return
         
-        # Obter caminho do arquivo IFC carregado
-        doc_path = doc.PathName
-        if not doc_path:
-            forms.alert(
-                "O documento nao foi salvo ou nao é um arquivo IFC.\n\n"
-                "Abra um arquivo .ifc no Revit primeiro.",
-                title="Erro",
-                warn_icon=True
-            )
-            return
+        # Detectar arquivos IFC vinculados
+        ifc_files = get_linked_ifc_files()
         
-        if not doc_path.lower().endswith('.ifc'):
+        if not ifc_files:
             forms.alert(
-                "Este plugin funciona apenas com arquivos .ifc\n\n"
-                "Arquivo atual: {}\n\n"
-                "Abra um arquivo .ifc no Revit.".format(doc_path),
+                "Nenhum arquivo IFC vinculado encontrado no modelo.\n\n"
+                "Vincule um arquivo .ifc antes de usar este plugin.",
                 title="Aviso",
                 warn_icon=True
             )
             return
         
-        if not os.path.exists(doc_path):
-            forms.alert(
-                "Arquivo nao encontrado: {}".format(doc_path),
-                title="Erro",
-                warn_icon=True
-            )
+        # Selecionar qual IFC usar (se houver mais de um)
+        selected_ifc = select_ifc_from_list(ifc_files)
+        if not selected_ifc:
             return
         
-        # Ler arquivo
-        ifc_text = read_text_file(doc_path)
+        ifc_path = selected_ifc['path']
+        ifc_name = selected_ifc['name']
+        
+        # Ler arquivo IFC
+        ifc_text = read_text_file(ifc_path)
         
         # Contar pavimentos
         ifc_storeys = count_ifc_storeys(ifc_text)
@@ -150,8 +191,8 @@ def main():
             return
         
         # Resumo
-        summary = "Analise do arquivo IFC:\n\n"
-        summary += "Arquivo: {}\n\n".format(os.path.basename(doc_path))
+        summary = "Analise do arquivo IFC vinculado:\n\n"
+        summary += "Arquivo: {}\n\n".format(ifc_name)
         summary += "- Colunas encontradas: {}\n".format(len(columns))
         summary += "- Vigas encontradas: {}\n".format(len(beams))
         summary += "- Pavimentos no IFC: {}\n".format(ifc_storeys)
