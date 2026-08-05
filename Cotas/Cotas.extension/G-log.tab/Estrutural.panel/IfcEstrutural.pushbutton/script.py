@@ -15,10 +15,20 @@ doc = revit.doc
 
 def pick_ifc_path():
     """Permite ao usuário selecionar arquivo IFC."""
-    try:
-        return forms.pick_file(file_ext="ifc")
-    except Exception:
-        return forms.pick_file()
+    import tkinter
+    from tkinter import filedialog
+    
+    root = tkinter.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    
+    file_path = filedialog.askopenfilename(
+        title="Selecionar arquivo IFC",
+        filetypes=[("IFC Files", "*.ifc"), ("All Files", "*.*")]
+    )
+    
+    root.destroy()
+    return file_path if file_path else None
 
 
 def read_text_file(file_path):
