@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Command">
+    <Name>RevitHydraulicCalc</Name>
+    <Assembly>RevitHydraulicCalc.dll</Assembly>
+    <AddInId>3A5B7C9D-1E2F-4A6B-8C3D-9E0F1A2B3C4D</AddInId>
+    <FullClassName>RevitHydraulicCalc.HydraulicCommand</FullClassName>
+    <VendorId>SEUEMPRESA</VendorId>
+    <VendorDescription>Calculadora Hidraulica para Revit</VendorDescription>
+  </AddIn>
+</RevitAddIns>
